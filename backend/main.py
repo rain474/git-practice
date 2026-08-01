@@ -1,25 +1,40 @@
+import os
 from fastapi import FastAPI, HTTPException
+import httpx
 from database import supabase
 
 app = FastAPI()
 
+# Dumaguete City exact coordinates
+LATITUDE = 9.3072
+LONGITUDE = 123.3066
+
+# Helper function to convert Open-Meteo WMO weather codes into plain words
+def get_condition_string(code: int) -> str:
+    # Standard WMO Weather Interpretation Codes
+    if code == 0: return "Clear sky"
+    elif code in: return "Mainly clear or partly cloudy"
+    elif code in: return "Foggy"
+    elif code in: return "Drizzle / Light Rain"
+    elif code in: return "Rain"
+    elif code in: return "Snow"
+    elif code in: return "Rain showers"
+    elif code in: return "Thunderstorm"
+    return "Cloudy"
+
+# Rule engine for clothing, umbrellas, and sun safety
 def generate_recommendations(temperature: float, uv_index: float, condition: str):
     gear = []
     clothing = []
     sun_safety = {}
 
-    # 1. Weather / Umbrella Logic
-    rain_keywords = ["rain", "drizzle", "shower", "thunderstorm", "storm", "typhoon"]
+    # 1. Umbrella Check
+    rain_keywords = ["rain", "drizzle", "shower", "thunderstorm", "storm"]
     if any(word in condition.lower() for word in rain_keywords):
         gear.append("Bring an umbrella")
-    elif "snow" in condition.lower():
-        gear.append("Wear a waterproof hooded jacket")
 
-    # 2. Temperature Logic (Celsius)
-    if temperature < 18:
-        clothing.append("Wear long sleeves")
-        clothing.append("Bring a thick jacket")
-    elif 18 <= temperature < 24:
+    # 2. Clothing advice for Philippine climate (Celsius)
+    if temperature < 24:
         clothing.append("Wear long sleeves or a light cardigan")
     elif 24 <= temperature < 30:
         clothing.append("Short sleeves or t-shirts are fine")
@@ -27,7 +42,7 @@ def generate_recommendations(temperature: float, uv_index: float, condition: str
         clothing.append("Wear lightweight, loose clothing")
         gear.append("Bring a cold water bottle to stay hydrated")
 
-    # 3. UV / Sunburn / Tanning Logic
+    # 3. UV / Sunburn / Tanning Metrics
     if uv_index <= 2:
         sun_safety["risk"] = "Low"
         sun_safety["sunburn_time"] = "Safe for up to 60 minutes"
@@ -44,7 +59,7 @@ def generate_recommendations(temperature: float, uv_index: float, condition: str
         sun_safety["tan_viability"] = "Fast tanning, high sunburn danger"
         gear.append("Wear sunglasses and a cap")
         clothing.append("Apply SPF 30+ sunscreen")
-    else:
+    else:  # UV 8+
         sun_safety["risk"] = "Very High / Extreme"
         sun_safety["sunburn_time"] = "Burns in under 10 minutes unprotected"
         sun_safety["tan_viability"] = "Extreme damage risk; skip tanning"
@@ -61,50 +76,56 @@ def generate_recommendations(temperature: float, uv_index: float, condition: str
 
 @app.get("/")
 def home():
-    return {"message": "WeatherWise App is online!"}
+    return {"message": "Dumaguete Weather Monitor is Online using Open-Meteo!"}
 
-# Send data to Supabase
-@app.post("/weather")
-def add_weather(city: str, temperature: float, condition: str, uv_index: float):
+# Single endpoint to trigger the live API request
+@app.get("/weather")
+async def get_dumaguete_weather():
+    # Build Open-Meteo URL targeting Dumaguete directly with current temperature, weather code, and UV Index
+    weather_url = (
+        f"https://open-meteo.com?"
+        f"latitude={LATITUDE}&longitude={LONGITUDE}"
+        f"&current=temperature_2m,weather_code,uv_index"
+    )
+    
+    async with httpx.AsyncClient() as client:
+        response = await client.get(weather_url)
+        
+    if response.status_code != 200:
+        raise HTTPException(status_code=response.status_code, detail="Open-Meteo API connection issue.")
+        
+    weather_data = response.json()
+    
+    # Extract live data points directly from Open-Meteo response
+    current_data = weather_data["current"]
+    temp_celsius = current_data["temperature_2m"]
+    weather_code = current_data["weather_code"]
+    live_uv = current_data["uv_index"]
+    
+    # Translate WMO code into readable words
+    condition_desc = get_condition_string(weather_code)
+
+    # Insert live data into your Supabase table history
     try:
         payload = {
-            "city": city,
-            "temperature": temperature,
-            "condition": condition,
-            "uv_index": uv_index
+            "city": "Dumaguete",
+            "temperature": temp_celsius,
+            "condition": condition_desc,
+            "uv_index": live_uv
         }
-        response = supabase.table("weather").insert(payload).execute()
-        return {"message": "Saved successfully", "data": response.data}
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
+        supabase.table("weather").insert(payload).execute()
+    except Exception as db_err:
+        print(f"Database save warning: {str(db_err)}")
 
-# Read data from Supabase and generate smart tips
-@app.get("/weather/{city}")
-def get_weather(city: str):
-    try:
-        response = (
-            supabase.table("weather")
-            .select("*")
-            .ilike("city", city)
-            .order("created_at", descending=True)
-            .limit(1)
-            .execute()
-        )
-        
-        if not response.data:
-            raise HTTPException(status_code=404, detail=f"No records found for {city}")
-            
-        latest = response.data[0]
-        tips = generate_recommendations(latest["temperature"], latest["uv_index"], latest["condition"])
-        
-        return {
-            "city": latest["city"],
-            "metrics": {
-                "temperature_celsius": latest["temperature"],
-                "condition": latest["condition"],
-                "uv_index": latest["uv_index"]
-            },
-            "advice": tips
-        }
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    # Run recommendation logic
+    tips = generate_recommendations(temp_celsius, live_uv, condition_desc)
+    
+    return {
+        "city": "Dumaguete City",
+        "live_metrics": {
+            "temperature_celsius": temp_celsius,
+            "condition": condition_desc,
+            "live_uv_index": live_uv
+        },
+        "smart_advice": tips
+    }
